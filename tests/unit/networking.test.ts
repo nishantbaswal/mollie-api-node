@@ -195,3 +195,39 @@ test('customApiEndpoint', () => {
     return bluster(mollieClient.customers.page.bind(mollieClient.customers))();
   });
 });
+
+test('ssrfPaginationOriginValidation', async () => {
+  return new NetworkMocker(getApiKeyClientProvider()).use(async ([mollieClient, networkMocker]) => {
+    // First page response contains a "next" link pointing to an attacker-controlled server.
+    networkMocker.intercept('GET', '/payments?limit=128', 200, {
+      _embedded: {
+        payments: [{ resource: 'payment', id: 'tr_mock0' }],
+      },
+      count: 1,
+      _links: {
+        next: {
+          href: 'https://attacker.example.com/steal?from=tr_mock0&limit=128',
+          type: 'application/hal+json',
+        },
+      },
+    });
+
+    // Iterating should yield the first page's items then throw when the tampered "next" URL is encountered.
+    const items: unknown[] = [];
+    let caughtError: unknown;
+    try {
+      for await (const payment of mollieClient.payments.iterate()) {
+        items.push(payment);
+      }
+    } catch (e) {
+      caughtError = e;
+    }
+
+    // The first page's item was consumed before the error.
+    expect(items).toHaveLength(1);
+    // An ApiError should be thrown when the tampered next-page URL is validated.
+    expect(caughtError).toBeDefined();
+    expect((caughtError as Error).message).toContain('Pagination link origin');
+    expect((caughtError as Error).message).toContain('attacker.example.com');
+  });
+});
