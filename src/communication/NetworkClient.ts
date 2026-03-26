@@ -124,6 +124,11 @@ export default class NetworkClient {
    * - appropriately process the response body before returning it (i.e. parsing it as JSON or throwing an ApiError if the response status indicates an error)
    */
   protected readonly request: (pathname: string, options?: RequestInit) => Promise<any>;
+  /**
+   * The trusted origin (scheme + host + port) of the configured API endpoint.
+   * Pagination URLs from API responses are validated against this origin to prevent SSRF credential leakage.
+   */
+  protected readonly trustedOrigin: string;
   constructor({
     apiKey,
     accessToken,
@@ -156,6 +161,14 @@ export default class NetworkClient {
     if (!apiEndpoint.endsWith('/')) {
       apiEndpoint += '/';
     }
+
+    // Validate that the API endpoint uses HTTPS to prevent credentials from being transmitted over insecure connections.
+    if (new URL(apiEndpoint).protocol !== 'https:') {
+      throw new TypeError('The API endpoint must use HTTPS to ensure credentials are transmitted securely.');
+    }
+
+    // Store the trusted origin for later validation of pagination URLs.
+    this.trustedOrigin = new URL(apiEndpoint).origin;
 
     // Create the request function.
     this.request = (pathname, options) => {
@@ -236,7 +249,7 @@ export default class NetworkClient {
       // and valuesPerMinute is set to 100, all 250 values received values will be yielded before the (two-minute)
       // break.
       const throttler = new Throttler(valuesPerMinute);
-      const { request } = this;
+      const { request, trustedOrigin } = this;
       return new HelpfulIterator<R>(
         (async function* iterate<R>() {
           let url = buildUrl(pathname, { ...query, limit: popLimit() });
@@ -258,8 +271,16 @@ export default class NetworkClient {
             if (links.next == null) {
               break;
             }
+            // Validate that the "next" link origin matches the trusted API endpoint origin to prevent SSRF credential leakage.
+            const nextHref: string = links.next.href;
+            const nextOrigin = new URL(nextHref).origin;
+            if (nextOrigin !== trustedOrigin) {
+              throw new ApiError(
+                `Pagination link origin "${nextOrigin}" does not match the configured API endpoint origin "${trustedOrigin}". This may indicate a compromised API response or man-in-the-middle attack. Verify your API endpoint configuration.`,
+              );
+            }
             // Build a URL from the "next" link in the response.
-            const [pathname, query] = breakUrl(links.next.href);
+            const [pathname, query] = breakUrl(nextHref);
             url = buildUrl(pathname, { ...query, limit: popLimit() });
             // Apply throttling.
             await throttler.throttle();
